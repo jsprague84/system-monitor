@@ -1,0 +1,328 @@
+//backup
+use sysinfo::{System, ProcessesToUpdate, Disks};
+use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::fs;
+use std::path::Path;
+
+fn main() {
+    let mut system = System::new_all();
+    let mut disks = Disks::new_with_refreshed_list();
+    
+    // Setup for non-blocking input detection
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+    
+    // Spawn input monitoring thread
+    thread::spawn(move || {
+        let mut input = String::new();
+        loop {
+            input.clear();
+            if io::stdin().read_line(&mut input).is_ok() {
+                if input.trim().to_lowercase() == "q" {
+                    running_clone.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    });
+    
+    // Initial refresh
+    system.refresh_all();
+    
+    // Initial screen setup
+    print!("\x1B[2J\x1B[H"); // Clear screen once at startup
+    let _ = io::stdout().flush();
+    
+    println!("\n🖥️  System Monitor - Press 'q' + Enter to quit\n");
+    println!("Refreshing every 2 seconds...\n");
+    
+    let mut last_update = Instant::now();
+    
+    while running.load(Ordering::Relaxed) {
+        if last_update.elapsed() >= Duration::from_secs(2) {
+            // Move cursor to top without clearing screen (eliminates flash)
+            print!("\x1B[H");
+            
+            // Refresh system data
+            system.refresh_cpu_all();
+            system.refresh_processes(ProcessesToUpdate::All, true);
+            system.refresh_memory();
+            disks.refresh(true);
+            
+            display_system_info(&system, &disks);
+            
+            // Clear any remaining lines from previous output
+            print!("\x1B[J");
+            
+            println!("\n📊 Updated: {}", chrono::Local::now().format("%H:%M:%S"));
+            println!("⌨️  Press 'q' + Enter to quit");
+            
+            // Ensure output is flushed
+            let _ = io::stdout().flush();
+            
+            last_update = Instant::now();
+        }
+        
+        // Small sleep to prevent excessive CPU usage
+        thread::sleep(Duration::from_millis(100));
+    }
+    
+    println!("\n👋 System monitor stopped. Goodbye!");
+}
+
+fn display_system_info(system: &System, disks: &Disks) {
+    // Display CPU usage
+    let cpu_usage = system.global_cpu_usage();
+    println!("🔥 === SYSTEM RESOURCE USAGE ===");
+    println!("🖥️ CPU Usage: {:.1}%", cpu_usage);
+    
+    // Display RAM usage
+    let total_memory = system.total_memory();
+    let used_memory = system.used_memory();
+    let memory_usage = (used_memory as f64 / total_memory as f64) * 100.0;
+    
+    println!("💾 RAM Usage: {:.1}% ({} MB / {} MB)", 
+             memory_usage, 
+             used_memory / 1_048_576, 
+             total_memory / 1_048_576);
+    
+    // Add a visual memory bar
+    let bar_length = 30;
+    let filled_length = (memory_usage / 100.0 * bar_length as f64) as usize;
+    let memory_bar: String = "█".repeat(filled_length) + &"░".repeat(bar_length - filled_length);
+    println!("    [{}] {:.1}%", memory_bar, memory_usage);
+    
+    println!();
+    
+    // Get top 5 processes by memory usage
+    let mut processes_by_memory: Vec<_> = system.processes()
+        .iter()
+        .map(|(pid, process)| (*pid, process))
+        .collect();
+    
+    processes_by_memory.sort_by(|a, b| b.1.memory().cmp(&a.1.memory()));
+    
+    println!("🔝 === TOP 5 PROCESSES BY MEMORY USAGE ===");
+    for (i, (pid, process)) in processes_by_memory.iter().take(5).enumerate() {
+        let memory_mb = process.memory() / 1_048_576;
+        let memory_percent = (process.memory() as f64 / system.total_memory() as f64) * 100.0;
+        println!("{}. PID: {:>7} | {} | Memory: {:>4} MB ({:.1}%)", 
+                 i + 1,
+                 pid,
+                 truncate_name(process.name().to_string_lossy().as_ref(), 20),
+                 memory_mb,
+                 memory_percent);
+    }
+    
+    println!();
+    
+    // Get top 5 processes by CPU usage
+    let mut processes_by_cpu: Vec<_> = system.processes()
+        .iter()
+        .map(|(pid, process)| (*pid, process))
+        .collect();
+    
+    processes_by_cpu.sort_by(|a, b| {
+        b.1.cpu_usage().partial_cmp(&a.1.cpu_usage()).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    
+    println!("⚡ === TOP 5 PROCESSES BY CPU USAGE ===");
+    for (i, (pid, process)) in processes_by_cpu.iter().take(5).enumerate() {
+        println!("{}. PID: {:>7} | {} | CPU: {:>5.1}%", 
+                 i + 1,
+                 pid,
+                 truncate_name(process.name().to_string_lossy().as_ref(), 20),
+                 process.cpu_usage());
+    }
+    
+    println!();
+    
+    // Display disk usage (df -h equivalent)
+    display_disk_usage(disks);
+    
+    // Display home directory size
+    display_home_directory_size();
+}
+
+fn truncate_name(name: &str, max_len: usize) -> String {
+    if name.len() > max_len {
+        format!("{}...", &name[..max_len-3])
+    } else {
+        format!("{:<width$}", name, width = max_len)
+    }
+}
+
+fn clear_screen() {
+    // Try multiple methods to clear screen for better terminal compatibility
+    
+    // Method 1: ANSI escape sequences
+    print!("\x1B[2J\x1B[1;1H");
+    
+    // Method 2: Alternative ANSI clear
+    print!("\x1B[H\x1B[J");
+    
+    // Method 3: Try system command as fallback
+    if std::process::Command::new("clear").status().is_err() {
+        // If clear command fails, try using tput
+        let _ = std::process::Command::new("tput").arg("clear").status();
+    }
+    
+    // Force flush the output
+    let _ = io::stdout().flush();
+}
+
+fn display_disk_usage(disks: &Disks) {
+    println!("💽 === DISK USAGE (df -h equivalent) ===");
+    
+    for disk in disks {
+        let total_space = disk.total_space();
+        let available_space = disk.available_space();
+        let used_space = total_space - available_space;
+        let usage_percent = if total_space > 0 {
+            (used_space as f64 / total_space as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        // Create visual bar for disk usage
+        let bar_length = 20;
+        let filled_length = (usage_percent / 100.0 * bar_length as f64) as usize;
+        let disk_bar: String = "█".repeat(filled_length.min(bar_length)) + 
+                               &"░".repeat(bar_length - filled_length.min(bar_length));
+        
+        println!("📁 {} | {} | Used: {} | Free: {} | [{}] {:.1}%",
+                 format!("{:<12}", disk.name().to_string_lossy()),
+                 format!("{:<8}", format_bytes(total_space)),
+                 format!("{:<8}", format_bytes(used_space)),
+                 format!("{:<8}", format_bytes(available_space)),
+                 disk_bar,
+                 usage_percent);
+    }
+}
+
+fn display_home_directory_size() {
+    println!();
+    println!("🏠 === HOME DIRECTORY SIZE ===");
+    
+    if let Some(home_dir) = dirs::home_dir() {
+        println!("📂 Calculating home directory size... (this may take a moment)");
+        
+        match calculate_directory_size(&home_dir) {
+            Ok(size) => {
+                // Clear the "calculating" message
+                print!("\x1B[1A\x1B[2K"); // Move up one line and clear it
+                
+                println!("📂 Home Directory: {} | Total Size: {}", 
+                         home_dir.display(), 
+                         format_bytes(size));
+                
+                // Show sizes of common subdirectories
+                let common_dirs = ["Documents", "Downloads", "Pictures", "Videos", "Desktop", "Music", ".config", ".cache"];
+                let mut dir_sizes = Vec::new();
+                
+                println!("📊 Scanning subdirectories...");
+                
+                for dir_name in &common_dirs {
+                    let dir_path = home_dir.join(dir_name);
+                    if dir_path.exists() && dir_path.is_dir() {
+                        // Use a timeout approach - if it takes too long, skip
+                        match std::panic::catch_unwind(|| calculate_directory_size(&dir_path)) {
+                            Ok(Ok(size)) if size > 0 => {
+                                dir_sizes.push((dir_name, size));
+                            }
+                            _ => continue,
+                        }
+                    }
+                }
+                
+                // Clear the "scanning" message
+                print!("\x1B[1A\x1B[2K");
+                
+                if !dir_sizes.is_empty() {
+                    // Sort by size and show top directories
+                    dir_sizes.sort_by(|a, b| b.1.cmp(&a.1));
+                    
+                    println!("📊 Top subdirectories in home:");
+                    for (i, (dir_name, size)) in dir_sizes.iter().take(6).enumerate() {
+                        println!("    {}. {:12} | {:>10}", 
+                                 i + 1, 
+                                 dir_name, 
+                                 format_bytes(*size));
+                    }
+                } else {
+                    println!("📊 No accessible subdirectories found");
+                }
+            }
+            Err(e) => {
+                print!("\x1B[1A\x1B[2K"); // Clear the "calculating" message
+                println!("❌ Could not calculate home directory size: {}", e);
+            }
+        }
+    } else {
+        println!("❌ Could not determine home directory path");
+    }
+    
+    println!(); // Add some spacing
+}
+
+fn calculate_directory_size(path: &Path) -> Result<u64, std::io::Error> {
+    let mut total_size = 0u64;
+    
+    if !path.is_dir() {
+        return Ok(0);
+    }
+    
+    // Use a simple approach that's less likely to hang
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    
+                    if let Ok(metadata) = entry.metadata() {
+                        if metadata.is_file() {
+                            total_size += metadata.len();
+                        } else if metadata.is_dir() {
+                            // Only recurse one level deep to avoid hanging
+                            if let Ok(sub_entries) = fs::read_dir(&path) {
+                                for sub_entry in sub_entries {
+                                    if let Ok(sub_entry) = sub_entry {
+                                        if let Ok(sub_metadata) = sub_entry.metadata() {
+                                            if sub_metadata.is_file() {
+                                                total_size += sub_metadata.len();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    
+    Ok(total_size)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+    
+    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+    
+    if unit_index == 0 {
+        format!("{} {}", bytes, UNITS[unit_index])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit_index])
+    }
+}
